@@ -1,0 +1,241 @@
+name: Build and Release moOde x86_64 Deb Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: write
+
+env:
+  TERM: xterm
+
+jobs:
+  # ============================================================
+  # 1. 扫描 packages/，跳过 ARM/RPi 专属包
+  # ============================================================
+  discover:
+    name: Discover packages
+    runs-on: ubuntu-24.04
+    outputs:
+      packages: ${{ steps.scan.outputs.packages }}
+      skipped: ${{ steps.scan.outputs.skipped }}
+      tag: ${{ steps.scan.outputs.tag }}
+    steps:
+      - name: Clone mslovecc/pkgbuild
+        run: git clone --depth 1 https://github.com/mslovecc/pkgbuild.git pkgbuild
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag || 'latest' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan packages
+        id: scan
+        run: |
+          set -eux
+          cd pkgbuild/packages
+
+          BLOCKLIST="
+            pcm1794a
+            boss2-oled-p3
+            motu-avb-usb
+            ax88179
+            rtl88xxau
+            rpi-source
+            chromium
+            moode-player
+            moode-apt-mark
+          "
+          BLOCKLIST_NORM=$(echo "$BLOCKLIST" | tr '\n' ' ' | tr -s ' ')
+
+          INCLUDE=""
+          EXCLUDE=""
+          for d in */; do
+            d="${d%/}"
+            [ -f "$d/build.sh" ] || continue
+            if echo " $BLOCKLIST_NORM " | grep -q " $d "; then
+              EXCLUDE="$EXCLUDE $d"
+            else
+              INCLUDE="$INCLUDE $d"
+            fi
+          done
+
+          INCLUDE_JSON=$(echo $INCLUDE | tr ' ' '\n' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          EXCLUDE_JSON=$(echo $EXCLUDE | tr ' ' '\n' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          echo "packages=$INCLUDE_JSON" >> "$GITHUB_OUTPUT"
+          echo "skipped=$EXCLUDE_JSON"  >> "$GITHUB_OUTPUT"
+
+          echo "tag=${{ steps.tag.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "===== 将构建的包 ====="
+          echo "$INCLUDE_JSON" | jq .
+          echo "===== 跳过的包 ====="
+          echo "$EXCLUDE_JSON" | jq .
+
+  # ============================================================
+  # 2. 并行构建 —— 每个包成功就立即发布到 Release
+  # ============================================================
+  build:
+    name: Build ${{ matrix.package }}
+    needs: discover
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:trixie-slim
+      options: --platform linux/amd64
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        package: ${{ fromJson(needs.discover.outputs.packages) }}
+
+    steps:
+      - name: Bootstrap base tools
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            sudo equivs \
+            git ca-certificates curl wget \
+            build-essential fakeroot debhelper dh-make devscripts \
+            pkg-config file dpkg-dev gcc g++ make \
+            libtool libtool-bin autoconf automake \
+            swig pv python3 python3-pip python3-setuptools \
+            libplist-utils xxd jq
+          sudo -E true
+          echo "sudo OK"
+
+      - name: Clone mslovecc/pkgbuild
+        run: git clone --depth 1 https://github.com/mslovecc/pkgbuild.git pkgbuild
+
+      - name: Prepare pkgbuild environment
+        run: |
+          set -eux
+          cd pkgbuild
+          if [ -f scripts/setenv.sh.example ] && [ ! -f scripts/setenv.sh ]; then
+            cp scripts/setenv.sh.example scripts/setenv.sh
+          fi
+          if [ -f setenv.sh.example ] && [ ! -f setenv.sh ]; then
+            cp setenv.sh.example setenv.sh
+          fi
+          chmod +x scripts/*.sh 2>/dev/null || true
+          chmod +x packages/${{ matrix.package }}/build.sh || true
+          echo "===== scripts/setenv.sh ====="
+          cat scripts/setenv.sh || echo "(不存在)"
+          echo "===== packages/${{ matrix.package }}/ ====="
+          ls -la packages/${{ matrix.package }}/ || true
+
+      - name: Build ${{ matrix.package }}
+        run: |
+          set -eux
+          cd pkgbuild
+          [ -f scripts/setenv.sh ] && . scripts/setenv.sh || true
+          [ -f setenv.sh ] && . setenv.sh || true
+          export PATH="$PWD/scripts:$PATH"
+          cd packages/${{ matrix.package }}
+          ./build.sh
+
+      - name: Collect deb artifacts
+        run: |
+          set -eux
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          echo "===== 搜索 .deb ====="
+          find "$GITHUB_WORKSPACE/pkgbuild" -type f -name "*.deb" -exec ls -lh {} \; || true
+          find "$GITHUB_WORKSPACE/pkgbuild" -type f -name "*.deb" \
+            -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \; || true
+          echo "===== artifacts/ ====="
+          ls -lh "$GITHUB_WORKSPACE/artifacts/" || true
+
+      - name: Verify architecture
+        if: hashFiles('artifacts/*.deb') != ''
+        run: |
+          set -eux
+          for deb in "$GITHUB_WORKSPACE/artifacts/"*.deb; do
+            echo "=== $deb ==="
+            dpkg-deb --info "$deb" | grep -E 'Package|Version|Architecture' || true
+          done
+
+      # ---------- 上传本包 artifact（供 finalize 打包） ----------
+      - name: Upload ${{ matrix.package }} artifact
+        if: hashFiles('artifacts/*.deb') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.package }}
+          path: artifacts/*.deb
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ---------- 编译成功 → 立即上传到 Release ----------
+      - name: Publish ${{ matrix.package }} to Release
+        if: hashFiles('artifacts/*.deb') != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.discover.outputs.tag }}
+          name: "moOde x86_64 Packages ${{ needs.discover.outputs.tag }}"
+          files: artifacts/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # 3. 汇总打包 —— 全部 build 结束后，把所有 deb 打包成一个压缩包
+  # ============================================================
+  finalize:
+    name: Bundle all debs
+    needs: [discover, build]
+    if: always() && needs.build.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-debs
+          pattern: deb-*
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: List collected debs
+        run: |
+          set -eux
+          find all-debs -type f -name '*.deb' -exec ls -lh {} \; || true
+          echo "===== 总计 ====="
+          find all-debs -type f -name '*.deb' | wc -l
+
+      - name: Create tarball
+        run: |
+          set -eux
+          TAG="${{ needs.discover.outputs.tag }}"
+          mkdir -p bundle/moode-x86_64-$TAG
+          find all-debs -type f -name '*.deb' \
+            -exec cp -v {} bundle/moode-x86_64-$TAG/ \;
+          cd bundle
+          tar -czf moode-x86_64-$TAG.tar.gz moode-x86_64-$TAG
+          ls -lh moode-x86_64-$TAG.tar.gz
+          sha256sum moode-x86_64-$TAG.tar.gz > moode-x86_64-$TAG.tar.gz.sha256
+          cat moode-x86_64-$TAG.tar.gz.sha256
+
+      - name: Upload tarball to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.discover.outputs.tag }}
+          name: "moOde x86_64 Packages ${{ needs.discover.outputs.tag }}"
+          files: |
+            bundle/moode-x86_64-${{ needs.discover.outputs.tag }}.tar.gz
+            bundle/moode-x86_64-${{ needs.discover.outputs.tag }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
